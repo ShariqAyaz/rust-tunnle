@@ -2,15 +2,17 @@ use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use url::Url;
-use tracing::{info, error};
+use tracing::{info, error, warn};
 use serde::{Serialize, Deserialize};
-use std::{env, time::Duration};
-use tokio::time::sleep;
+use std::{env, time::Duration, sync::Arc};
+use tokio::{time::sleep, sync::broadcast};
 
-const MAX_RETRIES: u32 = 5;
+const MAX_RETRIES: u32 = 10;
 const INITIAL_RETRY_DELAY_MS: u64 = 1000;
 const MAX_RETRY_DELAY_MS: u64 = 30000;
 const PING_INTERVAL_SECS: u64 = 30;
+const GATEWAY_UNREACHABLE_EXIT_CODE: i32 = 1;
+const SHUTDOWN_EXIT_CODE: i32 = 0;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -85,7 +87,10 @@ async fn handle_forwarded_request(request: ForwardedRequest) -> Result<String, B
         .map_err(|e| AgentError(format!("Failed to serialize response: {}", e)).into())
 }
 
-async fn connect_to_gateway(tunnel_id: String) -> Result<(), Box<dyn std::error::Error>> {
+async fn connect_to_gateway(
+    tunnel_id: String,
+    shutdown_rx: broadcast::Receiver<()>
+) -> Result<(), Box<dyn std::error::Error>> {
     let gateway_url = env::var("GATEWAY_URL")
         .unwrap_or_else(|_| "ws://localhost:3000".to_string());
     let ws_url = format!("{}/ws", gateway_url);
@@ -117,6 +122,7 @@ async fn connect_to_gateway(tunnel_id: String) -> Result<(), Box<dyn std::error:
 
     let mut ping_interval = tokio::time::interval(Duration::from_secs(PING_INTERVAL_SECS));
     let mut received_connection_id = false;
+    let mut shutdown_rx = shutdown_rx;
 
     loop {
         tokio::select! {
@@ -172,7 +178,7 @@ async fn connect_to_gateway(tunnel_id: String) -> Result<(), Box<dyn std::error:
                         }
                     }
                     Some(Ok(Message::Close(_))) => {
-                        info!("Gateway closed connection");
+                        info!("Gateway closed connection gracefully");
                         return Ok(());
                     }
                     Some(Ok(Message::Ping(data))) => {
@@ -190,7 +196,7 @@ async fn connect_to_gateway(tunnel_id: String) -> Result<(), Box<dyn std::error:
                         return Err(AgentError(error_msg).into());
                     }
                     None => {
-                        info!("WebSocket stream ended");
+                        warn!("WebSocket stream ended unexpectedly");
                         return Ok(());
                     }
                     _ => {}
@@ -202,18 +208,26 @@ async fn connect_to_gateway(tunnel_id: String) -> Result<(), Box<dyn std::error:
                     return Err(AgentError(format!("Failed to send ping: {}", e)).into());
                 }
             }
+            _ = shutdown_rx.recv() => {
+                info!("Shutdown signal received, closing connection...");
+                if let Err(e) = write.send(Message::Close(None)).await {
+                    warn!("Failed to send close message: {}", e);
+                }
+                return Ok(());
+            }
         }
     }
 }
 
-async fn connect_with_retry(tunnel_id: String) {
+async fn connect_with_retry(tunnel_id: String, shutdown_rx: broadcast::Receiver<()>) -> i32 {
     let mut retry_count = 0;
     let mut delay_ms = INITIAL_RETRY_DELAY_MS;
+    let mut shutdown_rx = shutdown_rx;
 
     loop {
         info!("Connection attempt {} of {}", retry_count + 1, MAX_RETRIES);
         
-        match connect_to_gateway(tunnel_id.clone()).await {
+        match connect_to_gateway(tunnel_id.clone(), shutdown_rx.resubscribe()).await {
             Ok(_) => {
                 info!("Connection closed gracefully, attempting to reconnect...");
                 retry_count = 0;
@@ -225,12 +239,20 @@ async fn connect_with_retry(tunnel_id: String) {
                 
                 if retry_count >= MAX_RETRIES {
                     error!("Max retries ({}) reached, exiting...", MAX_RETRIES);
-                    break;
+                    return GATEWAY_UNREACHABLE_EXIT_CODE;
                 }
                 
                 delay_ms = std::cmp::min(delay_ms * 2, MAX_RETRY_DELAY_MS);
                 info!("Retrying in {} ms...", delay_ms);
-                sleep(Duration::from_millis(delay_ms)).await;
+
+                // Add shutdown check during retry delay
+                tokio::select! {
+                    _ = sleep(Duration::from_millis(delay_ms)) => {}
+                    _ = shutdown_rx.recv() => {
+                        info!("Shutdown signal received during retry delay");
+                        return SHUTDOWN_EXIT_CODE;
+                    }
+                }
             }
         }
     }
@@ -249,6 +271,20 @@ async fn main() {
 
     info!("Starting agent with tunnel_id: {}", tunnel_id);
 
-    // Start connection with retry logic
-    connect_with_retry(tunnel_id).await;
+    // Create shutdown channel
+    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+    let shutdown_tx = Arc::new(shutdown_tx);
+
+    // Handle Ctrl+C
+    let shutdown_tx_clone = Arc::clone(&shutdown_tx);
+    tokio::spawn(async move {
+        if let Ok(()) = tokio::signal::ctrl_c().await {
+            info!("Received Ctrl+C, initiating shutdown...");
+            let _ = shutdown_tx_clone.send(());
+        }
+    });
+
+    // Start connection loop
+    let exit_code = connect_with_retry(tunnel_id, shutdown_rx).await;
+    std::process::exit(exit_code);
 } 
