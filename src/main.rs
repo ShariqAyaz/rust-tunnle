@@ -59,6 +59,7 @@ struct ConnectionDetails {
     connected_at: u64,
     tunnel_id: Option<String>,
     sender: UnboundedSender<Message>,
+    response_handler: Option<mpsc::Sender<serde_json::Value>>,
 }
 
 // Shared state between all connections
@@ -202,6 +203,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         connected_at,
         tunnel_id: None,
         sender,
+        response_handler: None,
     });
     
     info!("New WebSocket connection established: {}", connection_id);
@@ -272,6 +274,16 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                         } else if let Ok(msg) = serde_json::from_str::<WebSocketMessage>(&text) {
                             if msg.message_type == "response" {
                                 info!("Received response from agent {}: {}", connection_id, msg.payload);
+                                // Parse the response payload
+                                if let Ok(response) = serde_json::from_str::<serde_json::Value>(&msg.payload) {
+                                    // Get the response handler and send the response
+                                    let mut connections = state.connections.write().await;
+                                    if let Some(details) = connections.get_mut(&connection_id) {
+                                        if let Some(handler) = details.response_handler.take() {
+                                            let _ = handler.send(response).await;
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -311,47 +323,81 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 async fn handle_forward_request(
     State(state): State<Arc<AppState>>,
     axum::extract::Json(body): axum::extract::Json<serde_json::Value>,
-) -> impl IntoResponse {
-    let connections = state.connections.read().await;
+) -> Json<ApiResponse<serde_json::Value>> {
+    // Create channel for response
+    let (response_tx, mut response_rx) = mpsc::channel(1);
     
-    // Find an agent connection
-    let agent = connections.iter().find(|(_, details)| details.tunnel_id.is_some());
-    
-    match agent {
-        Some((connection_id, details)) => {
+    // Find an agent and set up response handler atomically
+    let send_result = {
+        let mut connections = state.connections.write().await;
+        
+        if let Some((connection_id, details)) = connections.iter_mut().find(|(_, details)| details.tunnel_id.is_some()) {
+            // Create the forward message
             let forward_msg = WebSocketMessage {
                 message_type: "request".to_string(),
                 payload: serde_json::to_string(&ForwardedRequest {
                     method: "POST".to_string(),
                     path: "/".to_string(),
-                    body: serde_json::to_string(&body).unwrap(),
+                    body: body.to_string(), // Use direct JSON string representation
                     headers: vec![("content-type".to_string(), "application/json".to_string())],
                 }).unwrap(),
             };
 
-            match details.sender.send(Message::Text(serde_json::to_string(&forward_msg).unwrap())) {
-                Ok(_) => {
-                    info!("Request forwarded to agent: {}", connection_id);
+            // Set response handler
+            details.response_handler = Some(response_tx);
+            
+            // Send message while still holding the lock
+            info!("Forwarding request to agent: {}", connection_id);
+            details.sender.send(Message::Text(serde_json::to_string(&forward_msg).unwrap()))
+        } else {
+            info!("No agents available for forwarding");
+            return Json(ApiResponse {
+                status: "error".to_string(),
+                message: "No agents available".to_string(),
+                data: None,
+            });
+        }
+    };
+
+    // Handle send result
+    match send_result {
+        Ok(_) => {
+            // Wait for response with timeout
+            match tokio::time::timeout(std::time::Duration::from_secs(5), response_rx.recv()).await {
+                Ok(Some(response)) => {
+                    info!("Received and forwarding agent response to client");
+                    // The response here is already parsed by the WebSocket handler
                     Json(ApiResponse {
                         status: "success".to_string(),
-                        message: format!("Request forwarded to agent {}", connection_id),
-                        data: None::<()>,
+                        message: "Request processed by agent".to_string(),
+                        data: Some(response),
                     })
                 }
-                Err(e) => {
-                    error!("Failed to forward request: {}", e);
+                Ok(None) => {
+                    error!("Response channel closed without response");
                     Json(ApiResponse {
                         status: "error".to_string(),
-                        message: "Failed to forward request".to_string(),
-                        data: None::<()>,
+                        message: "Agent connection lost".to_string(),
+                        data: None,
+                    })
+                }
+                Err(_) => {
+                    error!("Timeout waiting for agent response");
+                    Json(ApiResponse {
+                        status: "error".to_string(),
+                        message: "Timeout waiting for agent response".to_string(),
+                        data: None,
                     })
                 }
             }
         }
-        None => Json(ApiResponse {
-            status: "error".to_string(),
-            message: "No agents available".to_string(),
-            data: None::<()>,
-        }),
+        Err(e) => {
+            error!("Failed to send request to agent: {}", e);
+            Json(ApiResponse {
+                status: "error".to_string(),
+                message: format!("Failed to send request to agent: {}", e),
+                data: None,
+            })
+        }
     }
 } 
