@@ -10,7 +10,7 @@ A standalone Rust-based gateway service that:
 
 ```
                          Gateway Service
-                        (209.38.153.137)
+                        (127.0.0.1:3000)
                         ┌──────────────┐
                         │              │
 HTTP Clients            │   Gateway    │           Agents
@@ -56,13 +56,13 @@ RUST_LOG=info cargo run --bin gateway
 2. Test endpoints:
 ```bash
 # Health check
-curl http://209.38.153.137:3000/
+curl http://127.0.0.1:3000/
 
 # List connections
-curl http://209.38.153.137:3000/connections
+curl http://127.0.0.1:3000/connections
 
 # Forward request to agent
-curl -X POST http://209.38.153.137:3000/forward \
+curl -X POST http://127.0.0.1:3000/forward \
   -H "Content-Type: application/json" \
   -d '{"message": "Hello from client!"}'
 ```

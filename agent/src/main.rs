@@ -6,6 +6,7 @@ use tracing::{info, error, warn};
 use serde::{Serialize, Deserialize};
 use std::{env, time::Duration, sync::Arc};
 use tokio::{time::sleep, sync::broadcast};
+use std::str::FromStr;
 
 const MAX_RETRIES: u32 = 10;
 const INITIAL_RETRY_DELAY_MS: u64 = 1000;
@@ -13,6 +14,7 @@ const MAX_RETRY_DELAY_MS: u64 = 30000;
 const PING_INTERVAL_SECS: u64 = 30;
 const GATEWAY_UNREACHABLE_EXIT_CODE: i32 = 1;
 const SHUTDOWN_EXIT_CODE: i32 = 0;
+const LOCAL_APP_URL: &str = "http://127.0.0.1:8000";
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -62,21 +64,61 @@ impl std::error::Error for AgentError {}
 async fn handle_forwarded_request(request: ForwardedRequest) -> Result<String, Box<dyn std::error::Error>> {
     info!("Processing request: {} {}", request.method, request.path);
     
-    // Parse the request body
-    let body: serde_json::Value = serde_json::from_str(&request.body)
-        .map_err(|e| AgentError(format!("Failed to parse request body: {}", e)))?;
+    // Create the full URL for the local server
+    let local_url = format!("{}{}", LOCAL_APP_URL, request.path);
+    info!("Forwarding to local server: {}", local_url);
+
+    // Create HTTP client
+    let client = reqwest::Client::new();
+
+    // Create the request
+    let mut req_builder = match request.method.as_str() {
+        "GET" => client.get(&local_url),
+        "POST" => client.post(&local_url),
+        "PUT" => client.put(&local_url),
+        "DELETE" => client.delete(&local_url),
+        _ => return Err(AgentError(format!("Unsupported method: {}", request.method)).into()),
+    };
+
+    // Add headers
+    for (key, value) in request.headers {
+        req_builder = req_builder.header(key, value);
+    }
+
+    // Add body for non-GET requests
+    if request.method != "GET" {
+        let body: serde_json::Value = serde_json::from_str(&request.body)
+            .map_err(|e| AgentError(format!("Failed to parse request body: {}", e)))?;
+        req_builder = req_builder.json(&body);
+    }
+
+    // Send request to local server
+    let local_response = req_builder.send().await
+        .map_err(|e| AgentError(format!("Failed to forward request to local server: {}", e)))?;
     
+    // Get response status
+    let status = local_response.status();
+    
+    // Get response headers
+    let headers: Vec<(String, String)> = local_response.headers()
+        .iter()
+        .filter_map(|(key, value)| {
+            value.to_str().ok().map(|v| (key.to_string(), v.to_string()))
+        })
+        .collect();
+
+    // Get response body
+    let body = local_response.text().await
+        .map_err(|e| AgentError(format!("Failed to read local server response: {}", e)))?;
+
     // Create response
     let response = AgentResponse {
-        status: "success".to_string(),
-        message: "Request processed successfully".to_string(),
+        status: if status.is_success() { "success".to_string() } else { "error".to_string() },
+        message: format!("Local server responded with status {}", status),
         data: Some(serde_json::json!({
-            "request": {
-                "method": request.method,
-                "path": request.path,
-                "headers": request.headers,
-                "body": body,
-            },
+            "status_code": status.as_u16(),
+            "headers": headers,
+            "body": body,
             "timestamp": chrono::Utc::now().to_rfc3339(),
             "agent_version": env!("CARGO_PKG_VERSION"),
         })),
@@ -92,7 +134,7 @@ async fn connect_to_gateway(
     shutdown_rx: broadcast::Receiver<()>
 ) -> Result<(), Box<dyn std::error::Error>> {
     let gateway_url = env::var("GATEWAY_URL")
-        .unwrap_or_else(|_| "ws://209.38.153.137:3000".to_string());
+        .unwrap_or_else(|_| "ws://127.0.0.1:3000".to_string());
     let ws_url = format!("{}/ws", gateway_url);
     
     let url = Url::parse(&ws_url)

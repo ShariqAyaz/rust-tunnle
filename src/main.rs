@@ -4,6 +4,7 @@ use axum::{
     Router,
     response::{IntoResponse, Json},
     extract::ws::{WebSocket, WebSocketUpgrade, Message},
+    body::Body,
 };
 use futures::{stream::StreamExt, SinkExt};
 use std::{collections::HashMap, sync::Arc, net::SocketAddr, time::SystemTime};
@@ -12,6 +13,8 @@ use tracing::{info, warn, error};
 use uuid::Uuid;
 use serde::{Serialize, Deserialize};
 use serde_json;
+use axum::response::Response;
+use hyper::StatusCode;
 
 #[derive(Serialize)]
 struct ApiResponse<T> {
@@ -105,10 +108,11 @@ async fn main() {
 
     // Build our application with routes
     let app = Router::new()
-        .route("/", get(handle_health_check))
+        .route("/health", get(handle_health_check))
         .route("/ws", get(handle_websocket))
         .route("/connections", get(handle_list_connections))
         .route("/forward", post(handle_forward_request))
+        .route("/*path", get(handle_direct_request))
         .with_state(Arc::clone(&state));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
@@ -398,6 +402,106 @@ async fn handle_forward_request(
                 message: format!("Failed to send request to agent: {}", e),
                 data: None,
             })
+        }
+    }
+}
+
+async fn handle_direct_request(
+    State(state): State<Arc<AppState>>,
+    uri: axum::http::Uri,
+) -> Response<Body> {
+    let path = uri.path().to_string();
+    info!("Received direct GET request for path: {}", path);
+
+    // Create channel for response
+    let (response_tx, mut response_rx) = mpsc::channel(1);
+    
+    // Find an agent and set up response handler
+    let send_result = {
+        let mut connections = state.connections.write().await;
+        
+        if let Some((connection_id, details)) = connections.iter_mut().find(|(_, details)| details.tunnel_id.is_some()) {
+            // Create the forward message
+            let forward_msg = WebSocketMessage {
+                message_type: "request".to_string(),
+                payload: serde_json::to_string(&ForwardedRequest {
+                    method: "GET".to_string(),
+                    path: path.clone(),
+                    body: "".to_string(),
+                    headers: vec![
+                        ("accept".to_string(), "text/html,application/xhtml+xml".to_string()),
+                        ("user-agent".to_string(), "Mozilla/5.0".to_string()),
+                    ],
+                }).unwrap(),
+            };
+
+            // Set response handler
+            details.response_handler = Some(response_tx);
+            
+            // Send message while still holding the lock
+            info!("Forwarding request to agent: {}", connection_id);
+            details.sender.send(Message::Text(serde_json::to_string(&forward_msg).unwrap()))
+        } else {
+            info!("No agents available for forwarding");
+            return Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .body(Body::from("No agents available"))
+                .unwrap();
+        }
+    };
+
+    // Handle send result
+    match send_result {
+        Ok(_) => {
+            // Wait for response with timeout (increased to 30 seconds)
+            match tokio::time::timeout(std::time::Duration::from_secs(30), response_rx.recv()).await {
+                Ok(Some(response)) => {
+                    info!("Received response from agent");
+                    if let Some(data) = response.get("data") {
+                        if let Some(body) = data.get("body") {
+                            if let Some(body_str) = body.as_str() {
+                                return Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header("Content-Type", "text/html")
+                                    .header("Connection", "close") // Add this to prevent keep-alive
+                                    .body(Body::from(body_str.to_string()))
+                                    .unwrap();
+                            }
+                        }
+                        // If we got a response but couldn't extract the body
+                        error!("Invalid response format from agent: {:?}", data);
+                    }
+                    Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .header("Connection", "close")
+                        .body(Body::from("Invalid response format"))
+                        .unwrap()
+                }
+                Ok(None) => {
+                    error!("Agent connection lost while waiting for response");
+                    Response::builder()
+                        .status(StatusCode::BAD_GATEWAY)
+                        .header("Connection", "close")
+                        .body(Body::from("Agent connection lost"))
+                        .unwrap()
+                }
+                Err(_) => {
+                    error!("Request timed out after 30 seconds");
+                    Response::builder()
+                        .status(StatusCode::GATEWAY_TIMEOUT)
+                        .header("Connection", "close")
+                        .body(Body::from("Request timed out after 30 seconds"))
+                        .unwrap()
+                }
+            }
+        }
+        Err(e) => {
+            error!("Failed to send request to agent: {}", e);
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .header("Connection", "close")
+                .body(Body::from(format!("Failed to send request: {}", e)))
+                .unwrap()
         }
     }
 } 
