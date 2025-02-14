@@ -92,7 +92,7 @@ async fn connect_to_gateway(
     shutdown_rx: broadcast::Receiver<()>
 ) -> Result<(), Box<dyn std::error::Error>> {
     let gateway_url = env::var("GATEWAY_URL")
-        .unwrap_or_else(|_| "ws://localhost:3000".to_string());
+        .unwrap_or_else(|_| "ws://209.38.153.137:3000".to_string());
     let ws_url = format!("{}/ws", gateway_url);
     
     let url = Url::parse(&ws_url)
