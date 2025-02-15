@@ -57,7 +57,7 @@ struct AgentHandshake {
     agent_version: String,
 }
 
-// Connection information
+// Connection details
 struct ConnectionDetails {
     connected_at: u64,
     tunnel_id: Option<String>,
@@ -70,6 +70,7 @@ struct AppState {
     connections: RwLock<HashMap<String, ConnectionDetails>>,
 }
 
+// Validate tunnel ID format
 fn validate_tunnel_id(tunnel_id: &str) -> bool {
     // Format: agent_{uuid}_{purpose}
     let parts: Vec<&str> = tunnel_id.split('_').collect();
@@ -90,6 +91,16 @@ fn validate_tunnel_id(tunnel_id: &str) -> bool {
     parts[2].chars().all(|c| c.is_alphanumeric() || c == '_')
 }
 
+// Sequence 1: Gateway Startup and Initialisation
+// ----------------------------------------------
+// 1.1. Initialise logging and shutdown channel.
+// 1.2. Create shared state (AppState) to track active agent connections.
+// 1.3. Build HTTP routes:
+//      - /health for health check,
+//      - /ws for upgrading to WebSocket (agent connections),
+//      - /connections to list active connections,
+//      - /forward and catch‑all GET for request forwarding.
+// 1.4. Bind to a TCP listener and serve with graceful shutdown.
 #[tokio::main]
 async fn main() {
     // Initialize logging
@@ -157,6 +168,7 @@ async fn main() {
         .unwrap();
 }
 
+// Handle health check
 async fn handle_health_check() -> Json<ApiResponse<HealthResponse>> {
     Json(ApiResponse {
         status: "success".to_string(),
@@ -168,6 +180,7 @@ async fn handle_health_check() -> Json<ApiResponse<HealthResponse>> {
     })
 }
 
+// Handle listing active connections
 async fn handle_list_connections(State(state): State<Arc<AppState>>) -> Json<ApiResponse<Vec<ConnectionInfo>>> {
     let connections = state.connections.read().await;
     let connection_list: Vec<ConnectionInfo> = connections
@@ -186,6 +199,10 @@ async fn handle_list_connections(State(state): State<Arc<AppState>>) -> Json<Api
     })
 }
 
+// Sequence 2: WebSocket Connection Upgrade
+// -----------------------------------------
+// 2.1. Accept an HTTP connection on /ws and upgrade it to a WebSocket.
+// 2.2. Hand over the established socket to handle_socket for the full WebSocket lifecycle.
 async fn handle_websocket(
     State(state): State<Arc<AppState>>,
     ws: WebSocketUpgrade,
@@ -193,6 +210,15 @@ async fn handle_websocket(
     ws.on_upgrade(|socket| handle_socket(socket, state))
 }
 
+// Sequence 3: WebSocket Communication Lifecycle (Agent Connection)
+// -----------------------------------------------------------------
+// 3.1. Generate a unique connection ID and record the timestamp.
+// 3.2. Insert the new connection into shared state with initial details.
+// 3.3. Send the connection ID to the agent to initiate the handshake.
+// 3.4. Split the WebSocket into two parallel tasks:
+//      - Sender Task: Listens for messages queued for the agent (or pong responses).
+//      - Receiver Task: Processes incoming messages (handshake, responses, ping/pong).
+// 3.5. On connection closure or error, remove the connection from state.
 async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let connection_id = Uuid::new_v4().to_string();
     let connected_at = SystemTime::now()
@@ -324,6 +350,14 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     info!("Connection cleaned up: {}", connection_id);
 }
 
+// Sequence 4: Forward HTTP Request via Agent (POST /forward)
+// -----------------------------------------------------------
+// 4.1. Receive a POST HTTP request to forward.
+// 4.2. Create a one-shot response channel to receive the agent’s reply.
+// 4.3. Select an available agent that has completed the handshake (has a valid tunnel_id).
+// 4.4. Set the agent connection's response_handler to the response channel.
+// 4.5. Construct and send the forward message (containing method, path, body, headers) over WebSocket.
+// 4.6. Wait for the agent’s response with a timeout and return it to the HTTP client.
 async fn handle_forward_request(
     State(state): State<Arc<AppState>>,
     axum::extract::Json(body): axum::extract::Json<serde_json::Value>,
@@ -406,6 +440,14 @@ async fn handle_forward_request(
     }
 }
 
+// Sequence 5: Direct GET Request Handling via Agent (Catch-All GET)
+// ---------------------------------------------------------------
+// 5.1. Capture any GET request not matching other routes.
+// 5.2. Set up a response channel similar to the POST forward process.
+// 5.3. Identify an available agent to handle the request.
+// 5.4. Wrap and forward the GET request with appropriate headers and the requested path.
+// 5.5. Wait (with an extended timeout) for the agent response.
+// 5.6. Build and return the final HTTP response to the client.
 async fn handle_direct_request(
     State(state): State<Arc<AppState>>,
     uri: axum::http::Uri,
