@@ -6,70 +6,83 @@ A standalone Rust-based agent that:
 - Maintains persistent WebSocket connection
 - Forwards requests to local HTTP server and returns responses
 
-## Architecture
+## Technical Story & Implementation
 
-```
-Private Network                     Public Network
-┌─────────────────┐               ┌─────────────┐
-│  Local Server   │               │             │
-│    :8000    ◄───┤   WebSocket   │             │
-│                 │   connection  │   Gateway   │
-│  Agent Service  ├──────────────►│   :3000     │
-│    (No Port)    │   tunnel_id   │             │
-└─────────────────┘               └─────────────┘
-     Behind NAT                    Public Server
+The Agent Service acts as a bridge between the gateway and your local services, enabling secure access to services behind NAT:
 
-Connection Flow:
-1. Agent initiates WebSocket connection
-2. Gateway assigns connection ID
-3. Agent sends tunnel ID handshake
-4. Connection maintained with ping/pong
-5. Requests forwarded to local server (127.0.0.1:8000)
-```
+### Core Functionality
 
-## Current Implementation
+#### 1. Connection Management
+- Establishes WebSocket connection to gateway
+- Performs handshake with tunnel ID
+- Maintains connection with ping/pong
+- Handles reconnection with exponential backoff
+- Validates responses and manages errors
 
-### Features
-1. Connection Management:
-   - Automatic connection to gateway
-   - Secure tunnel ID validation
-   - Automatic reconnection with exponential backoff
-   - Connection health monitoring with ping/pong
-   - Maximum 10 retry attempts
+#### 2. Request Handling
+- Receives forwarded requests from gateway
+- Forwards to local HTTP server (default: http://127.0.0.1:8000)
+- Supports multiple HTTP methods (GET, POST)
+- Preserves headers and request body
+- Returns structured responses with metadata
 
-2. Request Handling:
-   - Receives forwarded HTTP requests from gateway
-   - Forwards requests to local server (127.0.0.1:8000)
-   - Supports GET and POST methods
-   - Preserves headers and request body
-   - Returns structured responses with metadata
+#### 3. Error Handling
+- Connection retry with exponential backoff (1-30 seconds)
+- Maximum 10 retry attempts
+- Detailed error logging
+- Graceful connection cleanup
+- Local server error handling
 
-3. Error Handling:
-   - Connection retry with exponential backoff (1-30 seconds)
-   - Maximum retry attempts (10)
-   - Detailed error logging
-   - Graceful connection cleanup
-   - Local server error handling
+## Prerequisites
 
-### Testing Locally
+Before starting the agent, ensure:
+1. Gateway service is running and accessible
+2. Local server (e.g., Laravel) is running on port 8000
+3. Valid tunnel ID is available
+4. No firewall blocking WebSocket connections
 
-1. Start your local server (e.g., Laravel) on port 8000:
+## Testing Locally
+
+1. Start your local server first:
 ```bash
 # Example: Laravel server
 php artisan serve
 ```
 
-2. Start the agent:
+2. Start the agent (from the agent directory):
 ```bash
-RUST_LOG=info cargo run --bin agent -- --tunnel-id YOUR_TUNNEL_ID
+cd agent && RUST_LOG=info cargo run --bin agent -- --tunnel-id agent_550e8400-e29b-41d4-a716-446655440000_prod
 ```
 
-Example tunnel ID:
-```
-agent_550e8400-e29b-41d4-a716-446655440000_prod
-```
+### Common Issues and Solutions
 
-3. Current Response Format:
+1. **"No bin target named 'agent'" Error**
+   - Symptom: Error when trying to run agent from main directory
+   - Solution: Change to agent directory first
+   ```bash
+   cd agent
+   ```
+
+2. **"Connection refused" to Local Server**
+   - Symptom: Error connecting to http://127.0.0.1:8000
+   - Solution: Start your local server before making requests
+   - Check: Ensure local server is running and port is correct
+
+3. **Gateway Connection Issues**
+   - Symptom: Cannot connect to gateway
+   - Check: Gateway URL (default: ws://127.0.0.1:3000/ws)
+   - Check: Firewall settings
+   - Check: Gateway service is running
+
+### Configuration
+
+- `GATEWAY_URL`: WebSocket gateway URL (default: ws://127.0.0.1:3000/ws)
+- `RUST_LOG`: Logging level (recommended: info)
+- `--tunnel-id`: Required command-line argument (format: agent_{uuid}_{purpose})
+- Local server URL: http://127.0.0.1:8000 (currently hardcoded)
+
+### Response Format
+
 ```json
 {
   "status": "success",
@@ -81,17 +94,20 @@ agent_550e8400-e29b-41d4-a716-446655440000_prod
       ["connection", "close"]
     ],
     "body": "Response from local server",
-    "timestamp": "2025-02-13T22:45:40.418279+00:00",
+    "timestamp": "2025-02-15T20:08:49.472112Z",
     "agent_version": "0.1.0"
   }
 }
 ```
 
-### Configuration
-- `GATEWAY_URL`: WebSocket gateway URL (default: ws://127.0.0.1:3000/ws)
-- `RUST_LOG`: Logging level (recommended: info)
-- `--tunnel-id`: Required command-line argument for identification
-- Local server URL: http://127.0.0.1:8000 (currently hardcoded)
+### Error Response Format
+
+```json
+{
+  "message_type": "error",
+  "payload": "Failed to forward request to local server: Connection refused (os error 61)"
+}
+```
 
 ### Known Limitations
 1. Hardcoded local server URL
@@ -99,6 +115,8 @@ agent_550e8400-e29b-41d4-a716-446655440000_prod
 3. No request validation or filtering
 4. Single-threaded request handling
 5. No request queueing or rate limiting
+6. No automatic local server health checks
+7. Limited error recovery options
 
 ## Next Steps
 1. Make local server URL configurable
@@ -107,4 +125,6 @@ agent_550e8400-e29b-41d4-a716-446655440000_prod
 4. Implement concurrent request handling
 5. Add metrics collection
 6. Add rate limiting and request queueing
-7. Enhance error recovery and circuit breaking 
+7. Enhance error recovery and circuit breaking
+8. Add local server health monitoring
+9. Implement automatic service discovery 

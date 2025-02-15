@@ -3,12 +3,12 @@
 A standalone Rust-based gateway service that:
 - Accepts WebSocket connections from agents
 - Validates agent tunnel IDs
-- Maintains persistent connections
+- Maintains persistent connections using DashMap for concurrent access
 - Forwards HTTP requests to connected agents and returns responses
 
 ## Technical Story & Sequence of Events
 
-The Gateway Service orchestrates communication between HTTP clients and agents through a series of well-defined sequences. Here's how the story unfolds:
+The Gateway Service orchestrates communication between HTTP clients and agents through a series of well-defined sequences:
 
 ### Core Sequences
 
@@ -16,7 +16,7 @@ The Gateway Service orchestrates communication between HTTP clients and agents t
 The gateway begins its life by setting up the foundation for all future operations:
 1. Initialises logging system for operational visibility
 2. Creates a shutdown channel for graceful termination
-3. Establishes shared state (AppState) to track agent connections
+3. Establishes shared state (AppState) using DashMap for concurrent connection tracking
 4. Configures HTTP routes:
    - `/health` for system status
    - `/ws` for WebSocket connections
@@ -36,7 +36,7 @@ When an agent attempts to connect:
 Once a WebSocket connection is established:
 1. Gateway generates a unique connection ID
 2. Records connection timestamp
-3. Adds connection to shared state
+3. Adds connection to DashMap state
 4. Sends connection ID to agent
 5. Splits communication into parallel tasks:
    - Sender: Handles outbound messages
@@ -62,79 +62,21 @@ For direct browser/client requests:
 5. Awaits response (30-second timeout)
 6. Returns formatted HTTP response
 
-### Supporting Methods
+### Prerequisites
 
-The gateway employs several supporting methods that enhance these core sequences:
-
-#### Tunnel ID Validation
-- **Method**: `validate_tunnel_id`
-- **Supports**: Sequence 3 (WebSocket Communication)
-- **Purpose**: Ensures agent identification follows the format `agent_{uuid}_{purpose}`
-- **Validation Rules**:
-  - Must have exactly 3 parts
-  - First part must be "agent"
-  - Second part must be valid UUID
-  - Third part must be alphanumeric with underscores
-- **Importance**: Critical for security and agent identification
-
-#### Health Check Handler
-- **Method**: `handle_health_check`
-- **Supports**: Sequence 1 (Gateway Operation)
-- **Purpose**: Provides system status and version information
-- **Usage**: Monitoring and system verification
-
-#### Connection Listing
-- **Method**: `handle_list_connections`
-- **Supports**: All sequences (Operational Monitoring)
-- **Purpose**: Provides visibility into active connections
-- **Usage**: System monitoring and debugging
-
-## Architecture
-
-```
-                         Gateway Service
-                        (127.0.0.1:3000)
-                        ┌──────────────┐
-                        │              │
-HTTP Clients            │   Gateway    │           Agents
-┌──────────┐            │   :3000      │        ┌──────────┐
-│          │────/──────►│   - State    │◄───────┤ Agent 1  │
-│ Client 1 │    HTTP    │   - Routes   │   WS   └──────────┘
-└──────────┘            │              │
-                        │              │        ┌──────────┐
-┌──────────┐            │              │◄───────┤ Agent 2  │
-│ Client 2 │────/───-──►│              │   WS   └──────────┘
-└──────────┘    HTTP    └──────────────┘
-
-WS = WebSocket Connection with tunnel_id
-```
-
-## Current Implementation
-
-### Features
-1. WebSocket Connections:
-   - Accepts agent connections via `/ws`
-   - Validates tunnel ID format: `agent_{uuid}_{purpose}`
-   - Maintains persistent connections with ping/pong
-   - Tracks connection state
-
-2. HTTP Endpoints:
-   - `GET /health` - Health check endpoint
-   - `GET /ws` - WebSocket endpoint for agents
-   - `GET /connections` - List active connections
-   - `POST /forward` - Forward requests to agents
-   - `GET /*path` - Direct request forwarding to agents
-
-3. Request Forwarding:
-   - Forwards HTTP requests to available agents
-   - Waits for agent responses (with timeouts)
-   - Returns responses to clients with appropriate status codes
-   - Supports both direct GET requests and POST forwarding
+Before starting the gateway, ensure:
+1. Port 3000 is available (will get "Address already in use" error otherwise)
+2. At least one agent is ready to connect
+3. The local server (e.g., Laravel on port 8000) is running for the agent to forward requests to
 
 ### Testing Locally
 
 1. Start the gateway:
 ```bash
+# Kill any existing process on port 3000 if needed
+lsof -ti:3000 | xargs kill -9
+
+# Start the gateway
 RUST_LOG=info cargo run --bin gateway
 ```
 
@@ -155,10 +97,23 @@ curl -X POST http://127.0.0.1:3000/forward \
 curl http://127.0.0.1:3000/about
 ```
 
-3. Start an agent:
-```bash
-RUST_LOG=info cargo run --bin agent -- --tunnel-id agent_550e8400-e29b-41d4-a716-446655440000_prod
-```
+### Common Issues and Solutions
+
+1. **"Address already in use" Error**
+   - Symptom: Gateway fails to start with error code 48
+   - Solution: Kill existing process using port 3000
+   ```bash
+   lsof -ti:3000 | xargs kill -9
+   ```
+
+2. **"Connection refused" Error on Requests**
+   - Symptom: Requests fail with "tcp connect error: Connection refused (os error 61)"
+   - Cause: Local server (e.g., Laravel) not running on port 8000
+   - Solution: Start your local server before making requests
+
+3. **No Agents Available**
+   - Symptom: Requests return "No agents available"
+   - Solution: Ensure at least one agent is connected and check `/connections` endpoint
 
 ### Known Limitations
 1. Single response handler per agent connection (potential race condition with concurrent requests)
@@ -166,6 +121,8 @@ RUST_LOG=info cargo run --bin agent -- --tunnel-id agent_550e8400-e29b-41d4-a716
 3. No authentication for HTTP endpoints
 4. No TLS support yet
 5. Limited error handling for concurrent requests
+6. Requires manual port management
+7. No automatic reconnection for lost agent connections
 
 ## Next Steps
 1. Implement concurrent request handling per agent
@@ -174,3 +131,5 @@ RUST_LOG=info cargo run --bin agent -- --tunnel-id agent_550e8400-e29b-41d4-a716
 4. Add request/response timeout configuration
 5. Implement proper error handling for concurrent scenarios
 6. Add metrics collection and monitoring
+7. Add automatic port conflict resolution
+8. Implement agent connection health checks

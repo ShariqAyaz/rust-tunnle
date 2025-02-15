@@ -7,14 +7,15 @@ use axum::{
     body::Body,
 };
 use futures::{stream::StreamExt, SinkExt};
-use std::{collections::HashMap, sync::Arc, net::SocketAddr, time::SystemTime};
-use tokio::sync::{RwLock, mpsc::{self, UnboundedSender, UnboundedReceiver}, broadcast};
+use std::{sync::Arc, net::SocketAddr, time::SystemTime};
+use tokio::sync::{broadcast, mpsc::{self, UnboundedSender}};
 use tracing::{info, warn, error};
 use uuid::Uuid;
 use serde::{Serialize, Deserialize};
 use serde_json;
 use axum::response::Response;
 use hyper::StatusCode;
+use dashmap::DashMap;
 
 #[derive(Serialize)]
 struct ApiResponse<T> {
@@ -58,6 +59,7 @@ struct AgentHandshake {
 }
 
 // Connection details
+#[derive(Debug)]
 struct ConnectionDetails {
     connected_at: u64,
     tunnel_id: Option<String>,
@@ -65,9 +67,9 @@ struct ConnectionDetails {
     response_handler: Option<mpsc::Sender<serde_json::Value>>,
 }
 
-// Shared state between all connections
+// Shared state between all connections using DashMap
 struct AppState {
-    connections: RwLock<HashMap<String, ConnectionDetails>>,
+    connections: DashMap<String, ConnectionDetails>,
 }
 
 // Validate tunnel ID format
@@ -112,9 +114,9 @@ async fn main() {
     let (shutdown_tx, _) = broadcast::channel(1);
     let shutdown_tx_clone = shutdown_tx.clone();
 
-    // Create shared state
+    // Create shared state with DashMap
     let state = Arc::new(AppState {
-        connections: RwLock::new(HashMap::new()),
+        connections: DashMap::new(),
     });
 
     // Build our application with routes
@@ -129,7 +131,7 @@ async fn main() {
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
     info!("Starting gateway server on {}", addr);
     info!("Available endpoints:");
-    info!("  GET    / - Health check");
+    info!("  GET    /health - Health check");
     info!("  GET    /ws - WebSocket endpoint");
     info!("  GET    /connections - List active connections");
     info!("  POST   /forward - Forward HTTP request");
@@ -138,15 +140,15 @@ async fn main() {
     tokio::spawn(async move {
         if let Ok(()) = tokio::signal::ctrl_c().await {
             info!("Shutdown signal received...");
-            let connections = state.connections.read().await;
-            info!("Notifying {} connected agents...", connections.len());
+            let connection_count = state.connections.len();
+            info!("Notifying {} connected agents...", connection_count);
             
             // Send close message to all connected agents
-            for (id, details) in connections.iter() {
-                if let Err(e) = details.sender.send(Message::Close(None)) {
-                    error!("Failed to send close message to agent {}: {}", id, e);
+            for entry in state.connections.iter() {
+                if let Err(e) = entry.value().sender.send(Message::Close(None)) {
+                    error!("Failed to send close message to agent {}: {}", entry.key(), e);
                 } else {
-                    info!("Close message sent to agent {}", id);
+                    info!("Close message sent to agent {}", entry.key());
                 }
             }
             
@@ -182,13 +184,12 @@ async fn handle_health_check() -> Json<ApiResponse<HealthResponse>> {
 
 // Handle listing active connections
 async fn handle_list_connections(State(state): State<Arc<AppState>>) -> Json<ApiResponse<Vec<ConnectionInfo>>> {
-    let connections = state.connections.read().await;
-    let connection_list: Vec<ConnectionInfo> = connections
+    let connection_list: Vec<ConnectionInfo> = state.connections
         .iter()
-        .map(|(id, details)| ConnectionInfo {
-            connection_id: id.clone(),
-            connected_at: details.connected_at,
-            tunnel_id: details.tunnel_id.clone(),
+        .map(|entry| ConnectionInfo {
+            connection_id: entry.key().clone(),
+            connected_at: entry.value().connected_at,
+            tunnel_id: entry.value().tunnel_id.clone(),
         })
         .collect();
 
@@ -228,8 +229,8 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 
     let (sender, mut receiver) = mpsc::unbounded_channel();
     
-    // Add connection to state
-    state.connections.write().await.insert(connection_id.clone(), ConnectionDetails {
+    // Add connection to DashMap
+    state.connections.insert(connection_id.clone(), ConnectionDetails {
         connected_at,
         tunnel_id: None,
         sender,
@@ -243,7 +244,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     // Send connection ID to the client
     if let Err(e) = ws_sender.send(Message::Text(connection_id.clone())).await {
         error!("Failed to send connection ID to client: {}", e);
-        state.connections.write().await.remove(&connection_id);
+        state.connections.remove(&connection_id);
         return;
     }
 
@@ -297,19 +298,16 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                             }
                             info!("Valid handshake from {} with tunnel ID: {}", connection_id, handshake.tunnel_id);
                             
-                            // Update connection with tunnel ID
-                            if let Some(details) = state.connections.write().await.get_mut(&connection_id) {
-                                details.tunnel_id = Some(handshake.tunnel_id);
+                            // Update connection with tunnel ID using proper mutable access
+                            if let Some(mut conn) = state.connections.get_mut(&connection_id) {
+                                conn.tunnel_id = Some(handshake.tunnel_id);
                             }
                         } else if let Ok(msg) = serde_json::from_str::<WebSocketMessage>(&text) {
                             if msg.message_type == "response" {
                                 info!("Received response from agent {}: {}", connection_id, msg.payload);
-                                // Parse the response payload
                                 if let Ok(response) = serde_json::from_str::<serde_json::Value>(&msg.payload) {
-                                    // Get the response handler and send the response
-                                    let mut connections = state.connections.write().await;
-                                    if let Some(details) = connections.get_mut(&connection_id) {
-                                        if let Some(handler) = details.response_handler.take() {
+                                    if let Some(mut conn) = state.connections.get_mut(&connection_id) {
+                                        if let Some(handler) = conn.response_handler.take() {
                                             let _ = handler.send(response).await;
                                         }
                                     }
@@ -346,56 +344,54 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     };
 
     // Clean up connection
-    state.connections.write().await.remove(&connection_id);
+    state.connections.remove(&connection_id);
     info!("Connection cleaned up: {}", connection_id);
 }
 
 // Sequence 4: Forward HTTP Request via Agent (POST /forward)
 // -----------------------------------------------------------
 // 4.1. Receive a POST HTTP request to forward.
-// 4.2. Create a one-shot response channel to receive the agent’s reply.
+// 4.2. Create a one-shot response channel to receive the agent's reply.
 // 4.3. Select an available agent that has completed the handshake (has a valid tunnel_id).
 // 4.4. Set the agent connection's response_handler to the response channel.
 // 4.5. Construct and send the forward message (containing method, path, body, headers) over WebSocket.
-// 4.6. Wait for the agent’s response with a timeout and return it to the HTTP client.
+// 4.6. Wait for the agent's response with a timeout and return it to the HTTP client.
 async fn handle_forward_request(
     State(state): State<Arc<AppState>>,
     axum::extract::Json(body): axum::extract::Json<serde_json::Value>,
 ) -> Json<ApiResponse<serde_json::Value>> {
-    // Create channel for response
     let (response_tx, mut response_rx) = mpsc::channel(1);
     
-    // Find an agent and set up response handler atomically
-    let send_result = {
-        let mut connections = state.connections.write().await;
-        
-        if let Some((connection_id, details)) = connections.iter_mut().find(|(_, details)| details.tunnel_id.is_some()) {
-            // Create the forward message
+    // Find an agent using DashMap
+    let mut agent_found = false;
+    let mut send_result = Ok(());
+
+    for mut entry in state.connections.iter_mut() {
+        if entry.value().tunnel_id.is_some() {
+            agent_found = true;
             let forward_msg = WebSocketMessage {
                 message_type: "request".to_string(),
                 payload: serde_json::to_string(&ForwardedRequest {
                     method: "POST".to_string(),
                     path: "/".to_string(),
-                    body: body.to_string(), // Use direct JSON string representation
+                    body: body.to_string(),
                     headers: vec![("content-type".to_string(), "application/json".to_string())],
                 }).unwrap(),
             };
 
-            // Set response handler
-            details.response_handler = Some(response_tx);
-            
-            // Send message while still holding the lock
-            info!("Forwarding request to agent: {}", connection_id);
-            details.sender.send(Message::Text(serde_json::to_string(&forward_msg).unwrap()))
-        } else {
-            info!("No agents available for forwarding");
-            return Json(ApiResponse {
-                status: "error".to_string(),
-                message: "No agents available".to_string(),
-                data: None,
-            });
+            entry.value_mut().response_handler = Some(response_tx.clone());
+            send_result = entry.value().sender.send(Message::Text(serde_json::to_string(&forward_msg).unwrap()));
+            break;
         }
-    };
+    }
+
+    if !agent_found {
+        return Json(ApiResponse {
+            status: "error".to_string(),
+            message: "No agents available".to_string(),
+            data: None,
+        });
+    }
 
     // Handle send result
     match send_result {
@@ -455,15 +451,15 @@ async fn handle_direct_request(
     let path = uri.path().to_string();
     info!("Received direct GET request for path: {}", path);
 
-    // Create channel for response
     let (response_tx, mut response_rx) = mpsc::channel(1);
     
-    // Find an agent and set up response handler
-    let send_result = {
-        let mut connections = state.connections.write().await;
-        
-        if let Some((connection_id, details)) = connections.iter_mut().find(|(_, details)| details.tunnel_id.is_some()) {
-            // Create the forward message
+    // Find an agent using DashMap
+    let mut agent_found = false;
+    let mut send_result = Ok(());
+
+    for mut entry in state.connections.iter_mut() {
+        if entry.value().tunnel_id.is_some() {
+            agent_found = true;
             let forward_msg = WebSocketMessage {
                 message_type: "request".to_string(),
                 payload: serde_json::to_string(&ForwardedRequest {
@@ -477,20 +473,18 @@ async fn handle_direct_request(
                 }).unwrap(),
             };
 
-            // Set response handler
-            details.response_handler = Some(response_tx);
-            
-            // Send message while still holding the lock
-            info!("Forwarding request to agent: {}", connection_id);
-            details.sender.send(Message::Text(serde_json::to_string(&forward_msg).unwrap()))
-        } else {
-            info!("No agents available for forwarding");
-            return Response::builder()
-                .status(StatusCode::SERVICE_UNAVAILABLE)
-                .body(Body::from("No agents available"))
-                .unwrap();
+            entry.value_mut().response_handler = Some(response_tx.clone());
+            send_result = entry.value().sender.send(Message::Text(serde_json::to_string(&forward_msg).unwrap()));
+            break;
         }
-    };
+    }
+
+    if !agent_found {
+        return Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .body(Body::from("No agents available"))
+            .unwrap();
+    }
 
     // Handle send result
     match send_result {
